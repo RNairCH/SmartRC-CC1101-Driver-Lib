@@ -7,8 +7,19 @@
 #ifndef SMARTRC_CC1101_H
 #define SMARTRC_CC1101_H
 
+
+#ifdef USE_ESP_IDF
+#include <cstdint>
+#include "driver/spi_master.h"
+#else
 #include <Arduino.h>
 #include <SPI.h>
+#endif
+
+#ifdef USE_ESP_IDF
+typedef uint8_t byte;
+#endif
+
 
 //***************************************CC1101 define**************************************************//
 // CC1101 CONFIG REGSITER
@@ -122,6 +133,7 @@ private:
 
   void SpiStart(void);
   void SpiEnd(void);
+  esp_err_t  SpiExecute(spi_device_handle_t handle, spi_transaction_t *t);
   bool WaitMiso(uint16_t timeout_ms = 200);
   void GDO_Set(void);
   void GDO0_Set(void);
@@ -130,6 +142,10 @@ private:
   void RegConfigSettings(void);
   void Calibrate(void);
   void setSpiPinMode(void);
+
+  spi_device_handle_t _handle;
+
+
 public:
   void Init(void);
   byte SpiReadStatus(byte addr);
@@ -198,6 +214,7 @@ public:
   void setCRC_AF(bool v);
   void setAppendStatus(bool v);
   void setAdrChk(byte v);
+
 };
 
 // ==============================================================================

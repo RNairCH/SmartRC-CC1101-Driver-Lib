@@ -3,7 +3,25 @@
 */
 #include "SmartRC_CC1101.h"
 #include <math.h>
+#ifdef USE_ESP_IDF
+#include <cstring>
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esphome/core/log.h"
+#else
 #include <Arduino.h>
+#endif
+
+static const char *TAG = "elechouse_cc1101_src_drv";
+
+#ifdef USE_ESP_IDF
+#define INPUT 0
+#define OUTPUT 1
+#define LOW 0
+#define HIGH 1
+#endif
+
+#define WRITE_SINGLE    0x00
 #define WRITE_BURST     0x40
 #define READ_SINGLE     0x80
 #define READ_BURST      0xC0
@@ -19,6 +37,17 @@ const uint8_t PA_TABLE_433[8]  = {0x12,0x0E,0x1D,0x34,0x60,0x84,0xC8,0xC0};
 const uint8_t PA_TABLE_868[10] = {0x03,0x17,0x1D,0x26,0x37,0x50,0x86,0xCD,0xC5,0xC0};
 const uint8_t PA_TABLE_915[10] = {0x03,0x0E,0x1E,0x27,0x38,0x8E,0x84,0xCC,0xC3,0xC0};
 
+#ifdef USE_ESP_IDF
+static inline int map(int x, int in_min, int in_max, int out_min, int out_max)
+{
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+static inline uint8_t bitRead(uint8_t value, uint8_t bit) {
+    return (value >> bit) & 0x01;
+}
+#endif
+
 bool SmartRC_CC1101::global_spi_initialized = false;
 
 // --- Global instances ---
@@ -31,20 +60,67 @@ SmartRC_CC1101& ELECHOUSE_cc1101 = SmartRC_cc1101;
 
 // --- Internal Helper Functions ---
 
+#ifdef USE_ESP_IDF
+
+void delay(unsigned long ms) {
+    vTaskDelay(ms / portTICK_PERIOD_MS);
+}
+
+void digitalWrite(uint8_t pin, uint8_t val) {
+    gpio_set_level((gpio_num_t)pin, val);
+}
+
+uint8_t digitalRead(uint8_t pin) {
+    return gpio_get_level((gpio_num_t)pin);
+}
+
+void pinMode(uint8_t pin, uint8_t mode) {
+    if (mode == OUTPUT) {
+        gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+    } else if (mode == INPUT) {
+        gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+    }
+}
+
+
+
+#endif
+
+
+
 bool SmartRC_CC1101::WaitMiso(uint16_t timeout_ms) {
-    uint32_t start = millis();
-    #if defined(ESP32)
-    while (gpio_get_level((gpio_num_t)MISO_PIN)) {
-        if (millis() - start > timeout_ms) return false;
-    }
-    #else
+    uint32_t start = esp_timer_get_time() / 1000; // Convert to milliseconds
     while (digitalRead(MISO_PIN)) {
-        if (millis() - start > timeout_ms) return false;
+        if (esp_timer_get_time() / 1000 - start > timeout_ms) return false;
     }
-    #endif
     return true;
 }
 
+#ifdef USE_ESP_IDF
+
+void SmartRC_CC1101::SpiStart(void) {
+    digitalWrite(SS_PIN, LOW);
+    while (!WaitMiso()) {
+        // Wait for MISO to go low
+    }
+}
+
+void SmartRC_CC1101::SpiEnd(void) {
+    digitalWrite(SS_PIN, HIGH);
+}
+
+esp_err_t SmartRC_CC1101::SpiExecute(spi_device_handle_t handle, spi_transaction_t *t) {
+    SpiStart();
+    esp_err_t err = spi_device_polling_transmit(handle, t);
+    while (!WaitMiso()) {
+        // Wait for MISO to go low
+    }
+    SpiEnd();
+    return err;
+}
+
+
+#else
 void SmartRC_CC1101::SpiStart(void) {
     SPI.beginTransaction(CC1101_SPI_SETTINGS);
     digitalWrite(SS_PIN, LOW);
@@ -55,8 +131,11 @@ void SmartRC_CC1101::SpiEnd(void) {
     SPI.endTransaction();
 }
 
+#endif
+
 void SmartRC_CC1101::GDO_Set(void) {
     pinMode(GDO0, OUTPUT);
+    digitalWrite(GDO0, LOW);
     pinMode(GDO2, INPUT);
 }
 
@@ -64,7 +143,73 @@ void SmartRC_CC1101::GDO0_Set(void) {
     pinMode(GDO0, INPUT);
 }
 
+
 // --- SPI Basis-Operationen ---
+
+#ifdef USE_ESP_IDF
+
+byte SmartRC_CC1101::SpiReadStatus(byte addr) {
+    spi_transaction_t t= {0};
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.addr = addr | READ_BURST;
+    t.tx_data[0] = 0; // dummy byte to clock out the status byte
+    t.length = 8;
+    t.rxlength = 8;
+    SpiExecute(_handle, &t);
+    return t.rx_data[0];
+}
+
+byte SmartRC_CC1101::SpiReadReg(byte addr) {
+    spi_transaction_t t= {0};
+    t.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
+    t.addr= addr | READ_SINGLE;
+    t.tx_data[0] = 0; // dummy byte to clock out the status byte
+    t.length = 8;
+    t.rxlength = 8;
+    SpiExecute(_handle, &t);
+    return t.rx_data[0];
+}
+
+void SmartRC_CC1101::SpiWriteReg(byte addr, byte value) {
+    spi_transaction_t t= {0};
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.addr = addr | WRITE_SINGLE;
+    t.tx_data[0] = value;
+    t.length = 8;
+    t.rxlength = 0;
+    SpiExecute(_handle, &t);
+}
+
+void SmartRC_CC1101::SpiStrobe(byte strobe) {
+    spi_transaction_t t= {0};
+    t.addr = strobe;
+    t.tx_buffer = NULL;
+    t.length = 0;
+    t.rxlength = 0;
+    SpiExecute(_handle, &t);
+}
+
+void SmartRC_CC1101::SpiWriteBurstReg(byte addr, byte *buffer, byte num) {
+    spi_transaction_t t= {0};
+    t.flags = 0;
+    t.addr = addr | WRITE_BURST;
+    t.tx_buffer = buffer;
+    t.length = num * 8;
+    t.rxlength = 0;
+    SpiExecute(_handle, &t);
+}
+
+void SmartRC_CC1101::SpiReadBurstReg(byte addr, byte *buffer, byte num) {
+    spi_transaction_t t= {0};
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.addr = addr | READ_BURST;
+    t.rx_buffer = buffer;
+    t.length = num * 8;
+    t.rxlength = num * 8;
+    SpiExecute(_handle, &t);
+}
+
+#else
 
 byte SmartRC_CC1101::SpiReadStatus(byte addr) {
     byte value = 0;
@@ -76,6 +221,7 @@ byte SmartRC_CC1101::SpiReadStatus(byte addr) {
     SpiEnd();
     return value;
 }
+
 
 byte SmartRC_CC1101::SpiReadReg(byte addr) {
     byte value = 0;
@@ -123,6 +269,8 @@ void SmartRC_CC1101::SpiReadBurstReg(byte addr, byte *buffer, byte num) {
     SpiEnd();
 }
 
+#endif
+
 // --- Setup and Configuration ---
 
 void SmartRC_CC1101::setSpi(void) {
@@ -159,6 +307,61 @@ void SmartRC_CC1101::setGDO0(byte gdo0) {
 
 void SmartRC_CC1101::Init(void) {
     setSpi();
+
+    #ifdef USE_ESP_IDF
+/*
+
+    const gpio_config_t output_config = {
+        .pin_bit_mask = (1ULL << SCK_PIN) | (1ULL << MOSI_PIN) | (1ULL << SS_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    const gpio_config_t input_config = {
+        .pin_bit_mask = (1ULL << MISO_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&output_config);
+    gpio_config(&input_config);
+*/
+    
+
+    const spi_bus_config_t buscfg = {
+        .mosi_io_num = MOSI_PIN,
+        .miso_io_num = MISO_PIN,
+        .sclk_io_num = SCK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 0
+    };
+    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+    const spi_device_interface_config_t devcfg = {
+        .command_bits = 0,
+        .address_bits = 8,
+        .dummy_bits = 0,
+        .mode = 0,
+        .duty_cycle_pos = 128,
+        .cs_ena_pretrans = 0,
+        .cs_ena_posttrans = 0,
+        .clock_speed_hz = 1000000,
+        .spics_io_num = -1,
+        .queue_size = 1,
+        .pre_cb = NULL,
+        .post_cb = NULL
+    };
+
+    spi_bus_add_device(SPI2_HOST, &devcfg, &_handle);
+
+    global_spi_initialized = true;
+
+    #else
     
 	#ifdef ESP32
 		if (!global_spi_initialized) {
@@ -181,6 +384,8 @@ void SmartRC_CC1101::Init(void) {
     digitalWrite(SCK_PIN, HIGH);
     digitalWrite(MOSI_PIN, LOW);
     #endif
+
+    #endif
     
     Reset();
     RegConfigSettings();
@@ -197,6 +402,17 @@ void SmartRC_CC1101::setSpiPinMode(void) {
 }
 
 void SmartRC_CC1101::Reset(void) {
+
+#ifdef USE_ESP_IDF
+    gpio_set_level((gpio_num_t)SS_PIN, 0);
+	vTaskDelay(1/portTICK_PERIOD_MS);
+	gpio_set_level((gpio_num_t)SS_PIN, 1);
+	vTaskDelay(1/portTICK_PERIOD_MS);
+    SpiStrobe(CC1101_SRES);
+    uint8_t chip_rev = SpiReadStatus(CC1101_VERSION);
+    //ESP_LOGI(TAG, "CC1101 Chip Revision: 0x%02X", chip_rev);
+
+#else
     digitalWrite(SS_PIN, LOW);
     delayMicroseconds(10);
     digitalWrite(SS_PIN, HIGH);
@@ -209,6 +425,7 @@ void SmartRC_CC1101::Reset(void) {
     }
     WaitMiso();
     digitalWrite(SS_PIN, HIGH);
+#endif
 }
 
 void SmartRC_CC1101::Calibrate(void) {
@@ -574,8 +791,19 @@ void SmartRC_CC1101::setPRE(byte v) {
 // --- Transceiver States ---
 
 void SmartRC_CC1101::SetTx(void) {
+    byte marcstate = 0;
     SpiStrobe(CC1101_SIDLE);
+    do {
+        marcstate = SpiReadStatus(CC1101_MARCSTATE) & 0x1F;
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Delay to avoid busy-waiting
+    } while (marcstate!= 0x01); // Wait for the radio to be in IDLE state);
+
     SpiStrobe(CC1101_STX);
+    do {
+        marcstate = SpiReadStatus(CC1101_MARCSTATE) & 0x1F;
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Delay to avoid busy-waiting
+    } while (marcstate != 0x13); // Wait for the radio to be in TX state
+
     trxstate = 1;
 }
 
@@ -641,10 +869,10 @@ void SmartRC_CC1101::SendData(byte *txBuffer, byte size) {
     SpiWriteBurstReg(CC1101_TXFIFO, txBuffer, size);
     SpiStrobe(CC1101_SIDLE);
     SpiStrobe(CC1101_STX);
-    uint32_t start = millis();
-    while (!digitalRead(GDO0) && (millis() - start < 500)); 
-    start = millis();
-    while (digitalRead(GDO0) && (millis() - start < 500));
+    uint32_t start = esp_timer_get_time() / 1000; // Get current time in milliseconds
+    while (!digitalRead(GDO0) && (esp_timer_get_time() / 1000 - start < 500)); 
+    start = esp_timer_get_time() / 1000;
+    while (digitalRead(GDO0) && (esp_timer_get_time() / 1000 - start < 500));
     SpiStrobe(CC1101_SFTX);
     trxstate = 1;
 }
@@ -688,8 +916,8 @@ bool SmartRC_CC1101::CheckRxFifo(int t) {
 byte SmartRC_CC1101::CheckReceiveFlag(void) {
     if (trxstate != 2) SetRx();
     if (digitalRead(GDO0)) {
-        uint32_t start = millis();
-        while (digitalRead(GDO0) && (millis() - start < 200));
+        uint32_t start = esp_timer_get_time() / 1000; // Get current time in milliseconds
+        while (digitalRead(GDO0) && (esp_timer_get_time() / 1000 - start < 200));
         return 1;
     } else {
         return 0;
